@@ -31,6 +31,7 @@ from sglang.srt.layers.linear import (
     RowParallelLinear,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessor
+from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
 from sglang.srt.layers.moe.fused_moe_triton.fused_moe import fused_moe
 from sglang.srt.layers.moe.topk import fused_topk
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
@@ -309,7 +310,6 @@ class Dots1Attention(nn.Module):
             # the KV heads across multiple tensor parallel GPUs.
             assert tp_size % self.total_num_kv_heads == 0
         self.num_kv_heads = max(1, self.total_num_kv_heads // tp_size)
-        # 若config有head_dim，则使用config的head_dim，否则使用hidden_size // self.total_num_heads
         self.head_dim = getattr(config, "head_dim", hidden_size // self.total_num_heads)
         self.q_size = self.num_heads * self.head_dim
         self.kv_size = self.num_kv_heads * self.head_dim
@@ -359,12 +359,10 @@ class Dots1Attention(nn.Module):
     ) -> torch.Tensor:
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
-        q = self.q_norm(q.reshape(-1, self.num_heads, self.head_dim)).reshape(
-            q.shape
+        q = self.q_norm(q.reshape(-1, self.num_heads, self.head_dim)).reshape(q.shape)
+        k = self.k_norm(k.reshape(-1, self.num_kv_heads, self.head_dim)).reshape(
+            k.shape
         )
-        k = self.k_norm(
-            k.reshape(-1, self.num_kv_heads, self.head_dim)
-        ).reshape(k.shape)
         q, k = self.rotary_emb(positions, q, k)
         attn_output = self.attn(q, k, v, forward_batch)
         output, _ = self.o_proj(attn_output)
@@ -518,6 +516,13 @@ class Dots1ForCausalLM(nn.Module):
             ("gate_up_proj", "up_proj", 1),
         ]
 
+        expert_params_mapping = get_moe_impl_class().make_expert_params_mapping(
+            ckpt_gate_proj_name="gate_proj",
+            ckpt_down_proj_name="down_proj",
+            ckpt_up_proj_name="up_proj",
+            num_experts=self.config.n_routed_experts,
+        )
+
         params_dict = dict(self.named_parameters())
         for name, loaded_weight in weights:
             if "rotary_emb.inv_freq" in name:
@@ -539,17 +544,36 @@ class Dots1ForCausalLM(nn.Module):
                 weight_loader(param, loaded_weight, shard_id)
                 break
             else:
-                # Skip loading extra bias for GPTQ models.
-                if name.endswith(".bias") and name not in params_dict:
-                    continue
-                # Skip experts that are not assigned to this worker.
-                if (
-                    "mlp.experts." in name or "mlp.shared_experts." in name
-                ) and name not in params_dict:
-                    continue
-                param = params_dict[name]
-                weight_loader = getattr(param, "weight_loader", default_weight_loader)
-                weight_loader(param, loaded_weight)
+                for mapping in expert_params_mapping:
+                    param_name, weight_name, expert_id, shard_id = mapping
+                    if weight_name not in name:
+                        continue
+                    name = name.replace(weight_name, param_name)
+
+                    param = params_dict[name]
+                    weight_loader = param.weight_loader
+                    weight_loader(
+                        param,
+                        loaded_weight,
+                        name,
+                        shard_id=shard_id,
+                        expert_id=expert_id,
+                    )
+                    break
+                else:
+                    # Skip loading extra bias for GPTQ models.
+                    if name.endswith(".bias") and name not in params_dict:
+                        continue
+                    # Skip experts that are not assigned to this worker.
+                    if (
+                        "mlp.experts." in name or "mlp.shared_experts." in name
+                    ) and name not in params_dict:
+                        continue
+                    param = params_dict[name]
+                    weight_loader = getattr(
+                        param, "weight_loader", default_weight_loader
+                    )
+                    weight_loader(param, loaded_weight)
 
 
 EntryClass = [Dots1ForCausalLM]
